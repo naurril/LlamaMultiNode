@@ -1,0 +1,1 @@
+export HF_HOME=/lab/haoq_lab/30008516/hfhome

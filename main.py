@@ -1,5 +1,5 @@
 import torch
-# import torch_npu
+import torch_npu
 import safetensors
 import transformers
 import json
@@ -13,8 +13,8 @@ import time
 import torch.distributed as dist
 
 CONFIG = {
-    'model_id': "meta-llama/Meta-Llama-3-8B-Instruct",
-    'device': 'cuda',
+    'model_id': "meta-llama/Meta-Llama-3.1-405B",
+    'device': 'npu',
     'max_context_length': 100,
     'max_output_tokens': 500,
 }
@@ -30,7 +30,7 @@ from typing import List, Optional, Tuple, Union
 
 # rank = int(os.environ["RANK"])         # Unique rank of the process
 # world_size = int(os.environ["WORLD_SIZE"]) # Total number of processes
-backend = "nccl"
+backend = "hccl"
 
 dist.init_process_group(
         backend=backend,       # Use NCCL for GPU communication, Gloo for CPU
@@ -48,8 +48,8 @@ local_rank = int(os.environ["LOCAL_RANK"])
 world_size = dist.get_world_size()
 backend = dist.get_backend()
 
-device_count = torch.cuda.device_count()
-device = f'cuda:{local_rank%device_count}'
+device_count = torch.npu.device_count()
+device = f'npu:{local_rank%device_count}'
 log("rank", rank, 'local_rank', local_rank,  "world_size", world_size, "backend", backend, "device", device)
 
 
@@ -188,7 +188,7 @@ class LLamaForCausalLMForMultiNodeInference(LlamaForCausalLM):
             if device_map['layers'][i] == rank:
                 # if output_hidden_states:
                 #     all_hidden_states += (hidden_states,)
-                if i > 1 and device_map['layers'][i-1] != rank:
+                if i > 0 and device_map['layers'][i-1] != rank:
                     # log(rank, 'hidden_states', hidden_states)
                     dist.recv(hidden_states, src=device_map['layers'][i-1], tag=device_map['layers'][i-1])
 
@@ -292,7 +292,7 @@ def broadcast_variant_tensor(tensor, dim, src):
 
 @torch.no_grad()
 def generate_response(model, tokenizer, input_ids, max_output, terminators):
-        log('start generate')
+        # log('start generate')
         response = []
         past_key_values = DynamicCache()
         terminated_tensor = torch.zeros(1, device=device)
@@ -365,7 +365,7 @@ def generate_response(model, tokenizer, input_ids, max_output, terminators):
         if rank == 0:
             print('')
         
-        log('end generate')
+        # log('end generate')
         return response
 
 
@@ -440,15 +440,15 @@ def chat(max_output=None):
 
 
 
-def calculate_device_map(model, node_num):
+def calculate_device_map(layers_num, node_num):
     
-    layers_num = len(model.base_model.layers)
+    # layers_num = len(model.base_model.layers)
 
     # embd layer is on gpu 0
     device_map = {
         'head': 0,
         'tail': world_size-1,
-        'layers': [],
+        'layers': [0, 0],
         "world_size": world_size,
         "layers_num": layers_num,
     }
@@ -456,14 +456,37 @@ def calculate_device_map(model, node_num):
     #allocate all layers into world_size - 1 gpus
 
     # layers for each node
-    layers_per_node = (layers_num + node_num - 2)// (node_num - 1)
-    device_map['layers_per_node']   = layers_per_node
+    
 
-    for i in range(1, world_size):
-        device_map[i] = []
-        for j in range(layers_per_node*(i-1), layers_per_node * i):
-            if j < layers_num:
-                device_map['layers'].append(i)
+    
+
+    # for i in range(1, world_size):
+    #     device_map[i] = []
+    #     for j in range(layers_per_node*(i-1), layers_per_node * i):
+    #         if j < layers_num:
+    #             device_map['layers'].append(i)
+    # device_map['layers'].append(0) # layer 0 is in rank 0
+    # device_map['layers'].append(0) # layer 1 is in rank 0
+    
+    
+    layers_per_node = (layers_num-2)// (node_num - 1)
+    device_map['layers_per_node']   = layers_per_node
+    remainder = (layers_num-2) % (node_num - 1)
+
+    node_index = 1
+    layers_in_node = 0
+    for i in range(2,layers_num):
+        if layers_in_node < layers_per_node:
+            device_map['layers'].append(node_index)
+            layers_in_node += 1
+        elif layers_in_node == layers_per_node and (node_index-1) < remainder:
+            device_map['layers'].append(node_index)
+            layers_in_node += 1
+        else:
+            node_index += 1
+            layers_in_node = 1
+            device_map['layers'].append(node_index)
+
 
     # first layer be in rank 0
     # device_map['layers'][0] = 0
@@ -471,8 +494,8 @@ def calculate_device_map(model, node_num):
     return device_map
 
 
-model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
-
+model_id = "meta-llama/Llama-3.1-405B-Instruct"
+#model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
 def load_meta_model():
     with torch.device("meta"):
         model = LLamaForCausalLMForMultiNodeInference.from_pretrained(model_id)        
@@ -482,7 +505,7 @@ def load_meta_model():
 model = load_meta_model()
 config = model.config
 # log(config)
-device_map = calculate_device_map(model, world_size)
+device_map = calculate_device_map(len(model.base_model.layers), world_size)
 
 log(device_map)
 
@@ -561,15 +584,13 @@ def load_model():
         load_module_state_dict(model.lm_head, "lm_head", state_dict)
         init_rope_module(model.base_model.rotary_emb)
 
-    else:
-        # load layers
-        for i, l in enumerate(model.base_model.layers):
-            if device_map['layers'][i] == rank:
-                load_module_state_dict(l, f"model.layers.{i}", state_dict)
-                init_rope_module(l.self_attn.rotary_emb)
+    # load layers
+    for i, l in enumerate(model.base_model.layers):
+        if device_map['layers'][i] == rank:
+            load_module_state_dict(l, f"model.layers.{i}", state_dict)
+            init_rope_module(l.self_attn.rotary_emb)
 
     if rank == world_size - 1:
-        
         load_module_state_dict(model.base_model.norm, "model.norm", state_dict)
 
 
@@ -714,5 +735,4 @@ def setup_model():
 
 chat(200)
 
-# test_inference(model)
-
+dist.destroy_process_group()

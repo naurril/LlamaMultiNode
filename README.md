@@ -1,8 +1,5 @@
 # LlamaMultiNode
 
-. env.sh
+llama inference on multiple-nodes
 
-
-torchrun --standalone --nproc_per_node=2 main.py
-
-python -i test.py
+tested Llama3.1-405B-Instruct on 4 Nodes, 32 NPU

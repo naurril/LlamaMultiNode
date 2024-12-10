@@ -1,36 +1,40 @@
 import torch
+import torch.distributed as dist
 import torch_npu
+
 import safetensors
 import transformers
 import json
 import os
-from transformers import LlamaForCausalLM, TextIteratorStreamer,AutoTokenizer, AutoConfig,  Cache, DynamicCache
-from transformers.utils import ModelOutput
-from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
-from transformers.processing_utils import Unpack
-import threading
 import time
-import torch.distributed as dist
 
-CONFIG = {
-    'model_id': "meta-llama/Meta-Llama-3.1-405B",
-    'device': 'npu',
-    'max_context_length': 100,
-    'max_output_tokens': 500,
-}
+import argparse
+from typing import List, Optional, Tuple, Union
+
+import numpy as np
+from transformers import LlamaForCausalLM, AutoTokenizer,  Cache, DynamicCache
+from transformers.modeling_outputs import CausalLMOutputWithPast
+
+
+argparser = argparse.ArgumentParser()
+argparser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
+argparser.add_argument("--device", type=str, default="npu", choices=["npu", "cuda"])
+
+args = argparser.parse_args()
+
+
+max_context_length = 100
+max_output_tokens = 500
+
+#model_id = "meta-llama/Llama-3.1-405B-Instruct"
+#model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
+
+model_id = args.model
+backend = "nccl" if args.device == "cuda" else "hccl"
+
 
 def log(*args, **kwargs):
     print(rank, *args, **kwargs)
-
-# def load_config(model_id):
-#     path = transformers.utils.cached_file(model_id, "config.json")
-#     with open(path, "r") as f:
-#         return json.load(f)
-from typing import List, Optional, Tuple, Union
-
-# rank = int(os.environ["RANK"])         # Unique rank of the process
-# world_size = int(os.environ["WORLD_SIZE"]) # Total number of processes
-backend = "hccl"
 
 dist.init_process_group(
         backend=backend,       # Use NCCL for GPU communication, Gloo for CPU
@@ -49,7 +53,7 @@ world_size = dist.get_world_size()
 backend = dist.get_backend()
 
 device_count = torch.npu.device_count()
-device = f'npu:{local_rank%device_count}'
+device = f'{args.device}:{local_rank%device_count}'
 log("rank", rank, 'local_rank', local_rank,  "world_size", world_size, "backend", backend, "device", device)
 
 
@@ -80,38 +84,10 @@ class LLamaForCausalLMForMultiNodeInference(LlamaForCausalLM):
         num_logits_to_keep: int = 0,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        
-        # # dist.barrier()
-        # log(rank, 'forward')
-        # # log all the arguments
-        # log("input_ids", input_ids)
-        # log("attention_mask", attention_mask)
-        # log("position_ids", position_ids)
-        # log("past_key_values", past_key_values)
-        # log("inputs_embeds", inputs_embeds)
-        # log("labels", labels)
-        # log("use_cache", use_cache)
-        # log("output_attentions", output_attentions)
-        # log("output_hidden_states", output_hidden_states)
-        # log("return_dict", return_dict)
-        # log("cache_position", cache_position)
-        # log("num_logits_to_keep", num_logits_to_keep)
-        # log("kwargs", kwargs)
-
-        # output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        # output_hidden_states = (
-        #     output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        # )
-        # return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
     
 
         # this is basically rewrite forward of llama model
         m = self.base_model # llama model
-
-        #use_cache = use_cache if use_cache is not None else self.config.use_cache
-        # use_cache = False
 
         if rank == 0:
             if (input_ids is None) ^ (inputs_embeds is not None):
@@ -122,36 +98,16 @@ class LLamaForCausalLMForMultiNodeInference(LlamaForCausalLM):
 
 
         if rank == 0:
-            # log(rank, inputs_embeds.shape, inputs_embeds.device, inputs_embeds.dtype)
             inputs_shape = torch.tensor(inputs_embeds.shape, device=device, dtype=torch.int64)
         else:
             inputs_shape = torch.empty(3, device=device, dtype=torch.int64)
 
-        #log(rank, 'inputs shape (before broadcast)', inputs_shape)
         dist.broadcast(inputs_shape, src=0)
-        # log(rank, 'inputs shape', inputs_shape)
 
         if rank != 0:
             inputs_embeds = torch.empty(tuple(inputs_shape.tolist()), device=device, dtype=torch.float32)
-            # log(rank, inputs_embeds.shape, inputs_embeds.device, inputs_embeds.dtype)
 
         dist.broadcast(inputs_embeds, src=0)
-        # log(rank, inputs_embeds.shape, inputs_embeds.device, inputs_embeds.dtype)
-        # log(rank, 'inputs_embeds', inputs_embeds)
-
-        # kept for BC (non `Cache` `past_key_values` inputs)
-        # return_legacy_cache = False
-        # if use_cache and not isinstance(past_key_values, Cache):
-        #     return_legacy_cache = True
-        #     if past_key_values is None:
-        #         past_key_values = DynamicCache()
-        #     else:
-        #         past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-        #         log(
-        #             "We detected that you are passing `past_key_values` as a tuple of tuples. This is deprecated and "
-        #             "will be removed in v4.47. Please convert your cache or use an appropriate `Cache` class "
-        #             "(https://huggingface.co/docs/transformers/kv_cache#legacy-cache-format)"
-        #         )
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -177,11 +133,6 @@ class LLamaForCausalLMForMultiNodeInference(LlamaForCausalLM):
         # all_self_attns = () if output_attentions else None
         # next_decoder_cache = None
 
-        # log(rank, 'hidden_states', hidden_states)
-        # log(rank, 'causal_mask', causal_mask)
-        # log(rank, 'position_ids', position_ids)
-        # log(rank, 'cache_position', cache_position)
-        # log(rank, 'position_embeddings', position_embeddings)
 
         for i,decoder_layer in enumerate(m.layers[: m.config.num_hidden_layers]):
             
@@ -212,37 +163,12 @@ class LLamaForCausalLMForMultiNodeInference(LlamaForCausalLM):
             else:
                 pass
 
-            # dist.broadcast(hidden_states, src=rank)
-
-            # if use_cache:
-            #     next_decoder_cache = layer_outputs[2 if output_attentions else 1]
-
-            # if output_attentions:
-            #     all_self_attns += (layer_outputs[1],)
 
         if rank == world_size - 1:
             hidden_states = m.norm(hidden_states)
 
         dist.broadcast(hidden_states, src=world_size-1)
-        # log(rank, 'hidden_states', hidden_states)
 
-        # add hidden states from the last decoder layer
-        # if output_hidden_states:
-        #     all_hidden_states += (hidden_states,)
-
-        # next_cache = next_decoder_cache if use_cache else None
-        # if return_legacy_cache:
-        #     next_cache = next_cache.to_legacy_cache()
-
-        # if not return_dict:
-        #     outputs= tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
-        # else
-        # outputs = BaseModelOutputWithPast(
-        #         last_hidden_state=hidden_states,
-        #         # past_key_values=next_cache,
-        #         # hidden_states=all_hidden_states,
-        #         # attentions=all_self_attns,
-            #     )
 
         
         # hidden_states = outputs[0]
@@ -378,13 +304,13 @@ def prepare_input(messages, tokenizer, device):
         attention_mask=True,
         padding=True,
     )
-    input_ids = input_ids[:, -CONFIG['max_context_length']:]
+    input_ids = input_ids[:, -max_context_length:]
     return input_ids.to(device)
 
 
 def chat(max_output=None):
     if max_output is None:
-        max_output = CONFIG['max_output_tokens']
+        max_output = max_output_tokens
         
     messages = []
     while True:
@@ -402,7 +328,7 @@ def chat(max_output=None):
                     log("User exiting chat...")
                     break
                 messages.append({"role": "user", "content": prompt})
-                input_ids = prepare_input(messages, tokenizer, CONFIG['device'])
+                input_ids = prepare_input(messages, tokenizer, device)
                 
                 start_time = time.time()
                 response = generate_response(
@@ -440,52 +366,87 @@ def chat(max_output=None):
 
 
 
-def calculate_device_map(layers_num, node_num):
+def calculate_device_map(model, node_num):
     
-    # layers_num = len(model.base_model.layers)
+    layers_num = len(model.base_model.layers)
 
     # embd layer is on gpu 0
     device_map = {
-        'head': 0,
-        'tail': world_size-1,
+        'embed_tokens': 0,
+        'lm_head': 0,
+        'norm': world_size-1,
+        
         'layers': [0, 0],
+        
         "world_size": world_size,
         "layers_num": layers_num,
     }
     
+    allocated_elements = np.zeros(world_size, dtype=np.int32)
+
     #allocate all layers into world_size - 1 gpus
 
     # layers for each node
-    
+
+
+    # embed_tokens and lm_head 
+    # norm
+    # lm_head
+    # layers
+
+    state_dict = model.state_dict()
+    def calc_mem_size(prefix):
+        size = 0
+        for name in state_dict:
+            if name.startswith(prefix):
+                size += state_dict[name].numel()
+        return size
 
     
 
-    # for i in range(1, world_size):
-    #     device_map[i] = []
-    #     for j in range(layers_per_node*(i-1), layers_per_node * i):
-    #         if j < layers_num:
-    #             device_map['layers'].append(i)
-    # device_map['layers'].append(0) # layer 0 is in rank 0
-    # device_map['layers'].append(0) # layer 1 is in rank 0
-    
-    
-    layers_per_node = (layers_num-2)// (node_num - 1)
-    device_map['layers_per_node']   = layers_per_node
-    remainder = (layers_num-2) % (node_num - 1)
+    allocated_elements[0] = calc_mem_size("model.embed_tokens") + calc_mem_size("lm_head")
+    allocated_elements[world_size-1] = calc_mem_size("model.norm")
 
-    node_index = 1
+    one_layer_size = calc_mem_size("model.layers.0")
+
+    node_layer_num = np.zeros(node_num, dtype=np.int32)
+
+    for i in range(layers_num):
+        idx = np.argmin(allocated_elements)
+        allocated_elements[idx] += one_layer_size
+        node_layer_num[idx] += 1
+
+    print("layers for nodes: ", node_layer_num)
+
+    node_index = 0
     layers_in_node = 0
-    for i in range(2,layers_num):
-        if layers_in_node < layers_per_node:
+    for i in range(layers_num):
+        if layers_in_node < node_layer_num[node_index]:
             device_map['layers'].append(node_index)
-            layers_in_node += 1
-        elif layers_in_node == layers_per_node and (node_index-1) < remainder:
-            device_map['layers'].append(node_index)
-            layers_in_node += 1
+            layers_in_node +=1
         else:
+            layers_in_node =1
             node_index += 1
-            layers_in_node = 1
             device_map['layers'].append(node_index)
+
+    
+    # layers_per_node = (layers_num-2)// (node_num - 1)
+    # device_map['layers_per_node']   = layers_per_node
+    # remainder = (layers_num-2) % (node_num - 1)
+
+    # node_index = 1
+    # layers_in_node = 0
+    # for i in range(2,layers_num):
+    #     if layers_in_node < layers_per_node:
+    #         device_map['layers'].append(node_index)
+    #         layers_in_node += 1
+    #     elif layers_in_node == layers_per_node and (node_index-1) < remainder:
+    #         device_map['layers'].append(node_index)
+    #         layers_in_node += 1
+    #     else:
+    #         node_index += 1
+    #         layers_in_node = 1
+    #         device_map['layers'].append(node_index)
 
 
     # first layer be in rank 0
@@ -494,8 +455,7 @@ def calculate_device_map(layers_num, node_num):
     return device_map
 
 
-model_id = "meta-llama/Llama-3.1-405B-Instruct"
-#model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
+
 def load_meta_model():
     with torch.device("meta"):
         model = LLamaForCausalLMForMultiNodeInference.from_pretrained(model_id)        
@@ -505,14 +465,14 @@ def load_meta_model():
 model = load_meta_model()
 config = model.config
 # log(config)
-device_map = calculate_device_map(len(model.base_model.layers), world_size)
+device_map = calculate_device_map(model, world_size)
 
 log(device_map)
 
 
 
 
-def load_state_dict(model_id):
+def load_state_dict(model_id, keys):
     safe_tensors_index_path = transformers.utils.cached_file(model_id, "model.safetensors.index.json")
     with open(safe_tensors_index_path, "r") as f:
         safe_tensors_index = json.load(f)
@@ -524,7 +484,7 @@ def load_state_dict(model_id):
             buffered_files[file] = safetensors.safe_open(os.path.join(folder, file), framework="pt")
         return buffered_files[file].get_tensor(key)
     state_dict = dict()
-    for k in safe_tensors_weight_map.keys():
+    for k in keys:
         st_file = safe_tensors_weight_map[k]
         tensor = load_tensors_from_checkpoint(st_file, k)
         if tensor is None:
@@ -536,23 +496,22 @@ def load_state_dict(model_id):
 
 
 
-def load_model_hf(device):
-    with torch.device(device):
-        model = LLamaForCausalLMForMultiNodeInference.from_pretrained(model_id)
-        model.eval()
-    return model
 
-
-def load_module_state_dict(module, prefix, state_dict):
+def load_module_state_dict(module, prefix):
     module.to_empty(device=device)
     sd = module.state_dict()
+    sd_disk = load_state_dict(model_id, map(lambda k: prefix + "." + k, sd.keys()))
+
+
     for k in sd.keys():
         if k in sd:
             k2 = prefix + "." + k
-            sd[k].copy_(state_dict[k2])
+            sd[k].copy_(sd_disk[k2])
             log(rank, 'loaded', k2, sd[k].device)
         else:
             log("Missing key", k)
+
+    # module.load_state_dict(sd_disk)
 
 def init_rope(model):
         for l in model.base_model.layers:
@@ -577,21 +536,21 @@ def init_rope_module(m):
 
 def load_model():
 
-    state_dict = load_state_dict(model_id)
+    # state_dict = load_state_dict(model_id)
 
     if rank == 0:
-        load_module_state_dict(model.base_model.embed_tokens, "model.embed_tokens", state_dict)
-        load_module_state_dict(model.lm_head, "lm_head", state_dict)
+        load_module_state_dict(model.base_model.embed_tokens, "model.embed_tokens")
+        load_module_state_dict(model.lm_head, "lm_head")
         init_rope_module(model.base_model.rotary_emb)
 
     # load layers
     for i, l in enumerate(model.base_model.layers):
         if device_map['layers'][i] == rank:
-            load_module_state_dict(l, f"model.layers.{i}", state_dict)
+            load_module_state_dict(l, f"model.layers.{i}")
             init_rope_module(l.self_attn.rotary_emb)
 
     if rank == world_size - 1:
-        load_module_state_dict(model.base_model.norm, "model.norm", state_dict)
+        load_module_state_dict(model.base_model.norm, "model.norm")
 
 
 load_model()
@@ -605,124 +564,6 @@ terminators = [
 ]
 
 
-# def test_inference(model):
-#     if rank == 0:
-#         tokenizer = AutoTokenizer.from_pretrained(model_id)
-#         tokenizer.pad_token = tokenizer.eos_token
-#         terminators = [
-#                 tokenizer.eos_token_id,
-#                 tokenizer.convert_tokens_to_ids("<|eot_id|>")
-#             ]
-#         messages = []
-#         messages.append({"role": "user", "content": "hello"})
-#         input_ids = tokenizer.apply_chat_template(
-#             messages,
-#             add_generation_prompt=True,
-#             return_tensors="pt",
-#             attention_mask = True,
-#             padding = True,
-#         ).to(device)
-
-#         output = model.generate(
-#             input_ids,
-#             max_new_tokens=256,
-#             eos_token_id=terminators,
-#             do_sample=True,
-#             temperature=0.6,
-#             top_p=0.9,
-#         )
-#         log("generate output", tokenizer.decode(output[0], skip_special_tokens=True))
-#     else:
-#         run_partial_model(model)
-
-# def chat(model):
-#     stopped = False
-#     if rank == 0:
-#         tokenizer = AutoTokenizer.from_pretrained(model_id)
-#         tokenizer.pad_token = tokenizer.eos_token
-#         terminators = [
-#                 tokenizer.eos_token_id,
-#                 tokenizer.convert_tokens_to_ids("<|eot_id|>")
-#             ]
-
-
-
-#         messages = []
-#         stop_signal = torch.zeros(1).to(device)
-#         while True:
-#             # get intput
-            
-#             prompt = input("User: ")
-#             if prompt == "exit":
-#                 stopped = True
-#                 stop_signal = stop_signal +1
-#                 dist.broadcast(stop_signal, src=0)
-#                 break
-#             else:
-#                 dist.broadcast(stop_signal, src=0)
-
-#             messages.append({"role": "user", "content": prompt})
-#             input_ids = tokenizer.apply_chat_template(
-#                 messages,
-#                 add_generation_prompt=True,
-#                 return_tensors="pt",
-#                 attention_mask = True,
-#                 padding = True,
-#             ).to(device)
-
-#             input_ids_shape = torch.tensor(input_ids.shape, device=device, dtype=torch.int64)
-#             dist.broadcast(input_ids_shape, src=0)
-#             dist.broadcast(input_ids, src=0)
-
-#             streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-            
-            
-#             thread = threading.Thread(
-#                 target = lambda :  model.generate(
-#                 input_ids,
-#                 max_new_tokens=256,
-#                 eos_token_id=terminators,
-#                 do_sample=False,
-#                 temperature=0.6,
-#                 top_p=0.9,
-#                 streamer=streamer
-#             ), daemon=True)
-#             thread.start()
-            
-#             response = ""
-#             for w in streamer:
-#                 log(w, end="", flush=True)
-#                 response += w
-#             log("")
-#             messages.append({"role": "assistant", "content": response})
-#     else:
-#         stop_signal = torch.zeros(1).to(device)
-#         while True:
-            
-#             dist.broadcast(stop_signal)
-
-#             if stop_signal.item == 1:
-#                 break
-
-#             input_ids_shape = torch.empty(2, device=device, dtype=torch.int64)
-#             dist.broadcast(input_ids_shape, src=0)
-
-#             input_ids = torch.empty(tuple(input_ids_shape.tolist()), device=device, dtype=torch.int64)
-#             dist.broadcast(input_ids, src=0)
-            
-#             model.generate(
-#                 input_ids,
-#                 max_new_tokens=256,
-#                 eos_token_id=terminators,
-#                 do_sample=False,
-#                 temperature=0.6,
-#                 top_p=0.9,
-#                 streamer=streamer
-#             )
-
-
-
-
 def setup_model():
     meta = load_meta_model()
     sd = load_state_dict(model_id)
@@ -733,6 +574,6 @@ def setup_model():
     init_rope(meta)
     return meta
 
-chat(200)
+chat(500)
 
 dist.destroy_process_group()

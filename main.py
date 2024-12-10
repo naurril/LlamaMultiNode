@@ -1,6 +1,9 @@
 import torch
 import torch.distributed as dist
-import torch_npu
+try:
+    import torch_npu
+except ImportError:
+    pass
 
 import safetensors
 import transformers
@@ -18,19 +21,41 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 argparser = argparse.ArgumentParser()
 argparser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
-argparser.add_argument("--device", type=str, default="npu", choices=["npu", "cuda"])
 
 args = argparser.parse_args()
 
 
-max_context_length = 100
+max_context_length = 1024
 max_output_tokens = 500
 
 #model_id = "meta-llama/Llama-3.1-405B-Instruct"
 #model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
 
 model_id = args.model
-backend = "nccl" if args.device == "cuda" else "hccl"
+
+device_type  = 'cpu'
+try:
+    if torch.cuda.is_available():
+        device_type = 'cuda'
+        device_count = torch.cuda.device_count()
+        backend = 'nccl'
+except:
+    pass
+
+try:
+    if torch.npu.is_available():
+        device_type = 'npu'
+        device_count = torch.npu.device_count()
+        backend = 'hccl'
+except:
+    pass
+    
+
+if device_type == 'cpu':
+    print("CPU is not supported")
+    exit(1)
+
+print("Device type: ", device_type)
 
 
 def log(*args, **kwargs):
@@ -52,8 +77,8 @@ local_rank = int(os.environ["LOCAL_RANK"])
 world_size = dist.get_world_size()
 backend = dist.get_backend()
 
-device_count = torch.npu.device_count()
-device = f'{args.device}:{local_rank%device_count}'
+
+device = f'{device_type}:{local_rank%device_count}'
 log("rank", rank, 'local_rank', local_rank,  "world_size", world_size, "backend", backend, "device", device)
 
 

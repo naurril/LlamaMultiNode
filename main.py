@@ -399,15 +399,13 @@ def calculate_device_map(model, node_num):
     device_map = {
         'embed_tokens': 0,
         'lm_head': 0,
-        'norm': world_size-1,
-        
-        'layers': [0, 0],
-        
+        'norm': world_size-1,        
+        'layers': [],        
         "world_size": world_size,
         "layers_num": layers_num,
     }
     
-    allocated_elements = np.zeros(world_size, dtype=np.int32)
+    allocated_elements = np.zeros(world_size, dtype=np.int64)
 
     #allocate all layers into world_size - 1 gpus
 
@@ -434,7 +432,7 @@ def calculate_device_map(model, node_num):
 
     one_layer_size = calc_mem_size("model.layers.0")
 
-    node_layer_num = np.zeros(node_num, dtype=np.int32)
+    node_layer_num = np.zeros(node_num, dtype=np.int64)
 
     for i in range(layers_num):
         idx = np.argmin(allocated_elements)

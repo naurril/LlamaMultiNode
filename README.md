@@ -2,8 +2,8 @@
 
 
 
-This repos uses pipeline-parallelism to do large-model inferencing. 
-If the mode is too large to fit into one single node (normally with 8 GPU cards), this repo may help.
+This repo uses pipeline-parallelism to do large-model inferencing. 
+If the model is too large to fit into one single node (normally with 8 GPU cards), this repo may help.
 
 Since it's pipeline parallel, all cards work sequentially, the inference delay increases with the model size. For Llama-3.1-405B-Instruct, with 32 910b Npu, inference time for one token is 1.5s.
 
